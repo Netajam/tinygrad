@@ -1,5 +1,5 @@
 from typing import Optional, Any, Callable
-import functools, itertools, operator
+import functools, itertools, operator, struct
 from collections import defaultdict
 from tinygrad.dtype import dtypes, ImageDType, PtrDType
 from tinygrad.ops import UOp, Ops, UPat, PatternMatcher, symbolic_flat, symbolic_simple, resolve
@@ -9,7 +9,7 @@ from tinygrad.codegen.transcendental import xexp2, xlog2, xsin, xpow, TRANSCENDE
 from tinygrad.renderer import Renderer
 
 # ***** float4/image store handling *****
-
+ 
 def fold_expanded(ex, buf):
   new_srcs = dedup(list(ex.src))
   old_new_srcs = new_srcs[:]
@@ -163,6 +163,16 @@ def threefry2x32(x: UOp, key: UOp):
 
   return xr[1].cast(dtypes.uint64) * 2**32 | xr[0].cast(dtypes.uint64)
 
+# ***** fold bitcast const *****
+def fold_bitcast_const(bitcast_op: UOp, const_op: UOp) -> UOp:
+    if  bitcast_op.dtype.itemsize != const_op.dtype.itemsize: raise RuntimeError(f"BITCAST dtype.itemsize= {bitcast_op.dtype.itemsize} do not mathc CONST dtype.itemsize={const_op.dtype.itemsize}")
+    if not (const_op.dtype.fmt or bitcast_op.dtype.fmt): raise RuntimeError("BITCAST or CONST dtype is bfloat16 (not supported for bitcast)")
+    old_data = (const_op.arg,) if not isinstance(const_op.arg, tuple) else const_op.arg
+    packed_bytes = bytearray()
+    for v in old_data:
+        packed_bytes.extend(struct.pack(const_op.dtype.fmt, int(v) if dtypes.is_int(const_op.dtype) else float(v) if dtypes.is_float(const_op.dtype) else bool(v)))
+    new_vals = tuple(struct.unpack(bitcast_op.dtype.fmt, packed_bytes[i:i+bitcast_op.dtype.itemsize])[0] for i in range(0, len(packed_bytes), bitcast_op.dtype.itemsize))
+    return UOp(Ops.CONST, bitcast_op.dtype, bitcast_op.src[1:], new_vals[0] if len(new_vals) == 1 else new_vals)
 # ***** main rewriter *****
 
 def loop_collapse(compval, multconst, rng:UOp, acc:UOp, idx2=None,idx3=None,extra=None,vec=None,ne=None,
@@ -286,6 +296,9 @@ sym = symbolic_flat+PatternMatcher([
   ((UPat.var('x', dtypes.uint64)&0xFFFFFFFF).cast(dtypes.uint32), lambda x: x.cast(dtypes.uint32)),  # cast does truncation
   (((UPat.var(None, dtypes.uint64)*(1<<32)) | UPat.var('y',  dtypes.uint32).cast(dtypes.uint64)).cast(dtypes.uint32), lambda y: y),
   (((UPat.var('x',  dtypes.uint64)*(1<<32)) | UPat.var(None, dtypes.uint32).cast(dtypes.uint64))//(1<<32), lambda x: x),
+  #fold bitcast const
+  (UPat(Ops.BITCAST,name="bitcast_op", src=(UPat(Ops.CONST, name="const_op"),)),fold_bitcast_const),
+  (UPat(Ops.BITCAST,name="bitcast_op", src=(UPat(Ops.CONST, name="const_op"),UPat.var())),fold_bitcast_const),
   # hacks for threefry long removal when padded (TODO: genericize)
   (UPat.var('x', dtypes.uint32).cast(dtypes.uint64) * UPat.var('y').where(UPat.const(dtypes.uint64, 1<<32), UPat.const(dtypes.uint64, 0)),
    lambda x,y: y.where(x, UOp.const(dtypes.uint32, 0)).cast(dtypes.uint64) * (1<<32)),

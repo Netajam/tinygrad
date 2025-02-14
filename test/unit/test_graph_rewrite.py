@@ -1,4 +1,4 @@
-import unittest, math
+import unittest, math, struct
 from tinygrad import dtypes
 from tinygrad.helpers import all_same
 from tinygrad.ops import GroupOp, UOp, Ops, exec_alu
@@ -142,6 +142,45 @@ class TestModuloAndDivisionFolding(unittest.TestCase):
       optimized_result = evaluate_uop(optimized_sink, {'x': x_value})
       self.assertEqual(original_result, optimized_result)
 
+class TestBitcastFolding(unittest.TestCase):
+  def test_bitcast_const_folding(self):
+    """Test folding BITCAST(CONST) into a single CONST."""
+    const_op = UOp.const(dtypes.int32, 42)
+    bitcast_op = UOp(Ops.BITCAST, dtypes.float32, (const_op,))
+    optimized_op = apply_rewrite(bitcast_op)
+    expected_val = struct.unpack(dtypes.float32.fmt, struct.pack(dtypes.int32.fmt, 42))[0]
+    self.assertEqual(optimized_op.op, Ops.CONST)
+    self.assertEqual(optimized_op.dtype, dtypes.float32)
+    self.assertEqual(optimized_op.arg, expected_val)
+
+  def test_bitcast_vector_const_folding(self):
+    """Test folding BITCAST(CONST) with a tuple as src.Only bitcasting the first element, keeping the rest unchanged."""
+    const_uop :UOp= UOp(Ops.CONST,dtypes.int16,arg= (1,3), src=())
+    second_uop:UOp=UOp(Ops.CONST, dtypes.float, arg=0.0, src=())
+    bitcast_uop = UOp(Ops.BITCAST, dtypes.uint16,arg=None ,src=(const_uop, second_uop))
+    optimized_uop = apply_rewrite(bitcast_uop)
+    packed_bytes = b"".join(struct.pack(dtypes.int16.fmt, v) for v in (1,3))
+    expected_vals = tuple(struct.unpack(dtypes.uint16.fmt, packed_bytes[i:i+2])[0] for i in range(0, len(packed_bytes), 2))
+    print(f"This is the original op{bitcast_uop}")
+    print(f"This is the optimized op {optimized_uop}")
+    self.assertEqual(optimized_uop.op, Ops.CONST)
+    self.assertEqual(optimized_uop.src[0],second_uop)
+    self.assertEqual(optimized_uop.dtype, dtypes.uint16)
+    self.assertEqual(optimized_uop.arg, expected_vals)
+
+  def test_bitcast_unsupported_dtype(self):
+    """Test BITCAST(CONST) folding when dtype is not supported (bfloat16), expecting RuntimeError ."""
+    const_op = UOp.const(dtypes.bfloat16, 42)
+    bitcast_op = UOp(Ops.BITCAST, dtypes.float32, (const_op,))
+    with self.assertRaises(RuntimeError):
+        apply_rewrite(bitcast_op)
+
+  def test_bitcast_size_mismatch(self):
+    """Test BITCAST(CONST) when dtype.itemsize do not match, expecting RuntimeError."""
+    const_op = UOp.const(dtypes.int16, 42)
+    bitcast_op = UOp(Ops.BITCAST, dtypes.float64, src=(const_op,))
+    with self.assertRaises(RuntimeError):
+        apply_rewrite(bitcast_op)
 
 class TestEdgeCasesAndSpecialOperations(unittest.TestCase):
   def test_full_graph_rewrite_transcendental_edge_cases(self):
